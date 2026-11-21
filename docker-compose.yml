@@ -7,3 +7,9 @@ services:
       # Localhost only: Caddy on the host proxies to it. Docker bypasses UFW,
       # so "3000:3000" would expose the app publicly over plain HTTP.
       - "127.0.0.1:6000:3000"
+    volumes:
+      # Finished games (history, replays). Survives rebuilds and restarts.
+      - games:/data
+
+volumes:
+  games:

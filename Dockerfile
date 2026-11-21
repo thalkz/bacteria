@@ -10,10 +10,14 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && r
 COPY src src
 COPY static static
 RUN touch src/main.rs && cargo build --release
+# Where finished games are saved. Mount a volume here to keep them.
+RUN mkdir /data
 
 FROM scratch
 COPY --from=build /app/target/release/bacteria /bacteria
-ENV PORT=3000
+COPY --from=build --chown=10001:10001 /data /data
+ENV PORT=3000 DATA_DIR=/data
+VOLUME /data
 EXPOSE 3000
 USER 10001
 ENTRYPOINT ["/bacteria"]

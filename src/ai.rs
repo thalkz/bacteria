@@ -18,8 +18,8 @@ pub enum Difficulty {
     Hard,
 }
 
-const INF: i32 = 1_000_000;
-const WIN: i32 = 1_000;
+pub(crate) const INF: i32 = 1_000_000;
+pub(crate) const WIN: i32 = 1_000;
 #[cfg(not(test))]
 const HARD_BUDGET: Duration = Duration::from_millis(900);
 #[cfg(test)]
@@ -64,7 +64,7 @@ pub fn choose(board: &Board, me: Player, level: Difficulty) -> Option<Move> {
 }
 
 /// Legal moves, keeping a single copy move per target (they all lead to the same board).
-fn candidates(board: &Board, p: Player) -> Vec<Move> {
+pub(crate) fn candidates(board: &Board, p: Player) -> Vec<Move> {
     let mut seen = vec![false; board.cells.len()];
     board
         .legal_moves(p)
@@ -79,7 +79,7 @@ fn gain(board: &Board, p: Player, m: Move) -> i32 {
     2 * captured + i32::from(!board.is_jump(m))
 }
 
-fn order(board: &Board, p: Player, moves: &mut [Move]) {
+pub(crate) fn order(board: &Board, p: Player, moves: &mut [Move]) {
     moves.sort_by_cached_key(|&m| -gain(board, p, m));
 }
 
@@ -93,19 +93,19 @@ fn stuck(board: &Board, p: Player) -> i32 {
     diff + diff.signum() * WIN
 }
 
-struct Search {
+pub(crate) struct Search {
     deadline: Option<Instant>,
     nodes: u64,
     aborted: bool,
 }
 
 impl Search {
-    fn new(deadline: Option<Instant>) -> Search {
+    pub(crate) fn new(deadline: Option<Instant>) -> Search {
         Search { deadline, nodes: 0, aborted: false }
     }
 
     /// Best move at the root, or `None` if time ran out before finishing this depth.
-    fn root(&mut self, board: &Board, me: Player, moves: &[Move], depth: u32) -> Option<(Move, i32)> {
+    pub(crate) fn root(&mut self, board: &Board, me: Player, moves: &[Move], depth: u32) -> Option<(Move, i32)> {
         let mut alpha = -INF;
         let mut best: Option<(Move, i32)> = None;
         for &m in moves {
@@ -123,7 +123,7 @@ impl Search {
         best
     }
 
-    fn negamax(&mut self, board: &Board, p: Player, depth: u32, mut alpha: i32, beta: i32) -> i32 {
+    pub(crate) fn negamax(&mut self, board: &Board, p: Player, depth: u32, mut alpha: i32, beta: i32) -> i32 {
         self.nodes += 1;
         if self.nodes % 1024 == 0 && self.deadline.is_some_and(|d| Instant::now() >= d) {
             self.aborted = true;

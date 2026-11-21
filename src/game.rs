@@ -39,7 +39,7 @@ pub enum Cell {
     Piece(Player),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Move {
     pub from: usize,
     pub to: usize,
@@ -64,20 +64,23 @@ impl Board {
     pub fn parse(rows: &[&str]) -> Board {
         let h = rows.len();
         let w = rows[0].len();
-        let mut cells = Vec::with_capacity(w * h);
-        for row in rows {
-            assert_eq!(row.len(), w, "ragged map");
-            for c in row.chars() {
-                cells.push(match c {
-                    '.' => Cell::Empty,
-                    '#' => Cell::Blocked,
-                    'G' => Cell::Piece(Player::Green),
-                    'R' => Cell::Piece(Player::Red),
-                    _ => panic!("bad map char {c}"),
-                });
-            }
-        }
-        Board { w, h, cells }
+        assert!(rows.iter().all(|r| r.len() == w), "ragged map");
+        Board::decode(w, h, &rows.concat()).expect("bad map")
+    }
+
+    /// The reverse of `encode`. `None` if the cells don't make a `w` x `h` board.
+    pub fn decode(w: usize, h: usize, cells: &str) -> Option<Board> {
+        let cells: Vec<Cell> = cells
+            .chars()
+            .map(|c| match c {
+                '.' => Some(Cell::Empty),
+                '#' => Some(Cell::Blocked),
+                'G' => Some(Cell::Piece(Player::Green)),
+                'R' => Some(Cell::Piece(Player::Red)),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        (w > 0 && cells.len() == w * h).then_some(Board { w, h, cells })
     }
 
     pub fn encode(&self) -> String {
@@ -191,6 +194,9 @@ pub struct LastMove {
 
 #[derive(Clone, Debug)]
 pub struct Game {
+    /// The position before the first move, kept for replays.
+    pub start: Board,
+    pub moves: Vec<Move>,
     pub board: Board,
     pub turn: Player,
     pub ply: u32,
@@ -201,7 +207,7 @@ pub struct Game {
 
 impl Game {
     pub fn new(board: Board) -> Game {
-        Game { board, turn: Player::Green, ply: 0, last: None, over: false }
+        Game { start: board.clone(), moves: Vec::new(), board, turn: Player::Green, ply: 0, last: None, over: false }
     }
 
     pub fn play(&mut self, p: Player, m: Move) -> Result<(), &'static str> {
@@ -217,6 +223,7 @@ impl Game {
         let jump = self.board.is_jump(m);
         let converted = self.board.apply(p, m);
         self.ply += 1;
+        self.moves.push(m);
 
         let mut filled = Vec::new();
         if self.board.has_moves(p.other()) {

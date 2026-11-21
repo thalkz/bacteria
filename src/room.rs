@@ -1,10 +1,12 @@
 //! Rooms: seats, move clock, computer turns and rematches. Everything lives in memory.
 
 use crate::ai::{self, Difficulty};
+use crate::analysis::Analyses;
 use crate::game::{Game, Move, Player};
+use crate::history::{History, PerColor, Record};
 use crate::maps;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -19,10 +21,17 @@ const LAG_GRACE: Duration = Duration::from_millis(600);
 const AI_MIN_DELAY: Duration = Duration::from_millis(750);
 pub const MAX_ROOMS: usize = 10_000;
 
-#[derive(Default)]
 pub struct AppState {
     pub rooms: Mutex<HashMap<String, Room>>,
     pub next_conn: AtomicU64,
+    pub history: History,
+    pub analyses: Analyses,
+}
+
+impl AppState {
+    pub fn new(history: History) -> AppState {
+        AppState { rooms: Mutex::default(), next_conn: AtomicU64::default(), history, analyses: Analyses::default() }
+    }
 }
 
 pub type Shared = Arc<AppState>;
@@ -34,6 +43,23 @@ pub enum Mode {
     Solo(Difficulty),
 }
 
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Online => "online",
+            Mode::Local => "local",
+            Mode::Solo(_) => "solo",
+        }
+    }
+
+    fn difficulty(self) -> Option<Difficulty> {
+        match self {
+            Mode::Solo(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
     Waiting,
@@ -41,8 +67,9 @@ enum Status {
     Finished,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reason {
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reason {
     Score,
     Timeout,
     Resign,
@@ -128,7 +155,7 @@ pub fn create(st: &Shared, mode: Mode) -> Option<(String, String)> {
 fn insert(st: &Shared, rooms: &mut HashMap<String, Room>, mode: Mode, seats: [Seat; 2]) -> String {
     let id = loop {
         let id = random_id(8);
-        if !rooms.contains_key(&id) {
+        if !rooms.contains_key(&id) && !st.history.contains(&id) {
             break id;
         }
     };
@@ -283,7 +310,7 @@ impl Room {
                     Role::Both => self.game.turn,
                     Role::Spectator => return None,
                 };
-                self.finish(Some(loser.other()), Reason::Resign);
+                self.finish(st, Some(loser.other()), Reason::Resign);
                 self.broadcast();
             }
             ClientMsg::Rematch => {
@@ -323,7 +350,7 @@ impl Room {
         tokio::spawn(async move {
             tokio::time::sleep(MOVE_TIME + LAG_GRACE).await;
             if let Some(room) = st2.rooms.lock().unwrap().get_mut(&id) {
-                room.on_timeout(seq);
+                room.on_timeout(&st2, seq);
             }
         });
 
@@ -355,7 +382,7 @@ impl Room {
         self.game.play(p, m)?;
         self.last_activity = Instant::now();
         if self.game.over {
-            self.finish(self.game.leader(), Reason::Score);
+            self.finish(st, self.game.leader(), Reason::Score);
         } else {
             self.start_turn(st);
         }
@@ -363,24 +390,47 @@ impl Room {
         Ok(())
     }
 
-    fn on_timeout(&mut self, seq: u64) {
+    fn on_timeout(&mut self, st: &Shared, seq: u64) {
         if self.seq != seq || self.status != Status::Playing {
             return;
         }
         if self.game.ply < 2 {
             // Someone never made their first move: call the game off, like Lichess.
-            self.finish(None, Reason::Aborted);
+            self.finish(st, None, Reason::Aborted);
         } else {
-            self.finish(Some(self.game.turn.other()), Reason::Timeout);
+            self.finish(st, Some(self.game.turn.other()), Reason::Timeout);
         }
         self.broadcast();
     }
 
-    fn finish(&mut self, winner: Option<Player>, reason: Reason) {
+    fn finish(&mut self, st: &Shared, winner: Option<Player>, reason: Reason) {
         self.status = Status::Finished;
         self.result = Some((winner, reason));
         self.deadline = None;
         self.seq += 1;
+        if reason != Reason::Aborted && !self.game.moves.is_empty() {
+            st.history.save(self.record(winner, reason));
+        }
+    }
+
+    fn record(&self, winner: Option<Player>, reason: Reason) -> Record {
+        let g = &self.game;
+        let ended_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        Record {
+            id: self.id.clone(),
+            mode: self.mode.name().into(),
+            difficulty: self.mode.difficulty(),
+            map: self.map.into(),
+            w: g.start.w,
+            h: g.start.h,
+            start: g.start.encode(),
+            moves: g.moves.clone(),
+            winner,
+            reason,
+            scores: PerColor { green: g.score(Player::Green), red: g.score(Player::Red) },
+            ai: PerColor { green: self.seats[Player::Green.idx()].ai, red: self.seats[Player::Red.idx()].ai },
+            ended_at,
+        }
     }
 
     fn send(&self, conn: u64, msg: Value) {
@@ -404,8 +454,8 @@ impl Room {
         };
         json!({
             "t": "state",
-            "mode": match self.mode { Mode::Online => "online", Mode::Local => "local", Mode::Solo(_) => "solo" },
-            "difficulty": match self.mode { Mode::Solo(d) => json!(d), _ => Value::Null },
+            "mode": self.mode.name(),
+            "difficulty": self.mode.difficulty(),
             "map": self.map,
             "w": g.board.w,
             "h": g.board.h,
