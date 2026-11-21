@@ -1,19 +1,17 @@
 //! Board quality evaluator: measures how interesting, strategically diverse,
-//! visually simple, and distinct a set of boards is.
+//! and distinct a set of boards is.
 //!
 //! Run from the CLI:
 //!   cargo run --release -- --eval-maps [--json] [custom_map_file...]
 //!
 //! Combines:
-//! 1. **Complex Interaction (35%)**: non-greedy tactical depth, game tension & lead
-//!    swings, combat conversions, wall-jump bridges, and chokepoint geometry.
-//! 2. **Strategical Diversity (30%)**: viable opening plans & spatial spread,
+//! 1. **Complex Interaction & Full-Game (45%)**: non-greedy tactical depth,
+//!    late-game tension & swings, combat conversions, wall-jump bridges, and
+//!    open flowing geometry.
+//! 2. **Strategical Diversity (35%)**: viable opening plans & spatial spread,
 //!    midgame trajectory divergence across diverse strong games, copy/jump balance,
 //!    multi-lane connectivity, and first-mover fairness.
-//! 3. **Visual Simplicity (20%)**: low wall fragmentation (few components, few
-//!    isolated 1×1 dots), orthogonal linearity & compactness, dihedral symmetry,
-//!    and positive spatial order.
-//! 4. **Distinctness (15%)**: dihedral-invariant layout distance (walls + starts
+//! 3. **Distinctness (20%)**: dihedral-invariant layout distance (walls + starts
 //!    across all 8 rotations/reflections) and gameplay-fingerprint distance from
 //!    every other board in the pool.
 
@@ -32,7 +30,6 @@ const OPEN_DEPTH: u32 = 5;
 const MAX_SIM_PLY: u32 = 140;
 
 const AROUND: [(i32, i32); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
-const ORTHO: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 const JUMPS: [(i32, i32); 4] = [(2, 0), (-2, 0), (0, 2), (0, -2)];
 
 #[derive(Clone, Debug, Serialize)]
@@ -46,7 +43,6 @@ pub struct InteractionMetrics {
     pub contact_conversions: f64,
     pub late_conversions: f64,
     pub wall_jump_rate: f64,
-    pub dead_ends: usize,
     pub mean_copy_degree: f64,
 }
 
@@ -60,20 +56,6 @@ pub struct DiversityMetrics {
     pub start_eval_cells: f64,
     pub green_win_rate: f64,
     pub multi_lane_score: f64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SimplicityMetrics {
-    pub score: f64,
-    pub walls: usize,
-    pub playable: usize,
-    pub components_4: usize,
-    pub components_8: usize,
-    pub isolated_dot_ratio: f64,
-    pub ortho_line_ratio: f64,
-    pub perimeter_per_wall: f64,
-    pub wall_symmetries: usize,
-    pub ortho_autocorr: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,7 +75,6 @@ pub struct BoardReport {
     pub avg_plies: f64,
     pub interaction: InteractionMetrics,
     pub diversity: DiversityMetrics,
-    pub simplicity: SimplicityMetrics,
     pub distinctness: DistinctnessMetrics,
     #[serde(skip)]
     fingerprint: [f64; 10],
@@ -171,24 +152,23 @@ pub fn evaluate_pool(boards: &[(&str, Board)]) -> PoolReport {
                 mean_dist: mean,
             };
         }
-        reports[i].overall = 0.35 * reports[i].interaction.score
-            + 0.30 * reports[i].diversity.score
-            + 0.20 * reports[i].simplicity.score
-            + 0.15 * reports[i].distinctness.score;
+        reports[i].overall = 0.45 * reports[i].interaction.score
+            + 0.35 * reports[i].diversity.score
+            + 0.20 * reports[i].distinctness.score;
     }
 
     PoolReport { boards: reports, pairwise_distances: pair_mat, pairwise_layout_distances: layout_mat }
 }
 
 fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
-    let simplicity = eval_simplicity(board);
+    let walls = board.cells.iter().filter(|&&c| c == Cell::Blocked).count();
     let topo = eval_topology(board);
     let opening = eval_openings(board);
     let sim = run_simulations(board, seed);
 
     // Pillar 1: Complex Interaction & Full-Game Vitality (0..100)
     // Heavily rewards sustained combat, late-game tension (avoiding early-decided "filling"),
-    // tactical non-greedy play, and open flowing layouts without dead ends.
+    // tactical non-greedy play, and open flowing layouts.
     let non_greedy_s = scale_0_100(sim.non_greedy_rate, 0.15, 0.60);
     let full_game_s = 0.45 * scale_0_100(sim.alive_fraction, 0.40, 0.90)
         + 0.30 * scale_0_100(sim.late_conversions, 0.20, 1.30)
@@ -196,9 +176,8 @@ fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
     let combat_s = 0.45 * scale_0_100(sim.contact_conversions, 0.35, 1.50)
         + 0.30 * scale_0_100(sim.final_closeness, 0.50, 0.93)
         + 0.25 * scale_0_100(sim.wall_jump_rate, 0.01, 0.11);
-    let flow_s = 0.45 * trapezoid_0_100(topo.mean_copy_degree, 3.8, 5.2, 6.5, 7.3)
-        + 0.35 * (100.0 - scale_0_100(topo.dead_ends as f64, 0.0, 5.0))
-        + 0.20 * (100.0 - scale_0_100(topo.cramped_ratio, 0.04, 0.32));
+    let flow_s = 0.65 * trapezoid_0_100(topo.mean_copy_degree, 3.8, 5.2, 6.5, 7.3)
+        + 0.35 * (100.0 - scale_0_100(topo.cramped_ratio, 0.04, 0.32));
     let interaction_score = 0.20 * non_greedy_s + 0.35 * full_game_s + 0.25 * combat_s + 0.20 * flow_s;
 
     let interaction = InteractionMetrics {
@@ -211,7 +190,6 @@ fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
         contact_conversions: sim.contact_conversions,
         late_conversions: sim.late_conversions,
         wall_jump_rate: sim.wall_jump_rate,
-        dead_ends: topo.dead_ends,
         mean_copy_degree: topo.mean_copy_degree,
     };
 
@@ -240,7 +218,7 @@ fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
 
     let total_cells = (board.w * board.h).max(1) as f64;
     let fingerprint = [
-        simplicity.walls as f64 / total_cells,
+        walls as f64 / total_cells,
         topo.mean_copy_degree,
         topo.wall_jump_bridge_ratio,
         topo.start_distance,
@@ -258,7 +236,6 @@ fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
         avg_plies: sim.avg_plies,
         interaction,
         diversity,
-        simplicity,
         distinctness: DistinctnessMetrics {
             score: 0.0,
             nearest_neighbor: String::new(),
@@ -271,162 +248,10 @@ fn evaluate_single(name: &str, board: &Board, seed: u64) -> BoardReport {
     }
 }
 
-/* ------------------------------------------------------------------ visual simplicity */
-
-fn eval_simplicity(board: &Board) -> SimplicityMetrics {
-    let (w, h) = (board.w, board.h);
-    let n = w * h;
-    let is_wall = |x: i32, y: i32| -> bool {
-        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-            false
-        } else {
-            board.cells[y as usize * w + x as usize] == Cell::Blocked
-        }
-    };
-
-    let walls = board.cells.iter().filter(|&&c| c == Cell::Blocked).count();
-    let playable = n - walls;
-
-    let comp4 = wall_components(board, &ORTHO);
-    let comp8 = wall_components(board, &AROUND);
-
-    let mut isolated_dots = 0usize;
-    let mut in_ortho_line = 0usize;
-    let mut exposed_edges = 0usize;
-
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            if !is_wall(x, y) {
-                continue;
-            }
-            let ortho_n = ORTHO.iter().filter(|&&(dx, dy)| is_wall(x + dx, y + dy)).count();
-            if ortho_n == 0 {
-                isolated_dots += 1;
-            } else {
-                in_ortho_line += 1;
-            }
-            exposed_edges += 4 - ortho_n;
-        }
-    }
-
-    let isolated_dot_ratio = if walls > 0 { isolated_dots as f64 / walls as f64 } else { 0.0 };
-    let ortho_line_ratio = if walls > 0 { in_ortho_line as f64 / walls as f64 } else { 0.0 };
-    let perimeter_per_wall = if walls > 0 { exposed_edges as f64 / walls as f64 } else { 0.0 };
-
-    // Orthogonal spatial autocorrelation (Moran-like: tendency of orthogonally adjacent cells
-    // to share the same wall/non-wall state vs alternating like checkerboard scatter).
-    let p_wall = walls as f64 / n.max(1) as f64;
-    let var = p_wall * (1.0 - p_wall);
-    let mut cov_sum = 0.0;
-    let mut pairs = 0usize;
-    for y in 0..h {
-        for x in 0..w {
-            let a = if board.cells[y * w + x] == Cell::Blocked { 1.0 } else { 0.0 } - p_wall;
-            if x + 1 < w {
-                let b = if board.cells[y * w + (x + 1)] == Cell::Blocked { 1.0 } else { 0.0 } - p_wall;
-                cov_sum += a * b;
-                pairs += 1;
-            }
-            if y + 1 < h {
-                let b = if board.cells[(y + 1) * w + x] == Cell::Blocked { 1.0 } else { 0.0 } - p_wall;
-                cov_sum += a * b;
-                pairs += 1;
-            }
-        }
-    }
-    let ortho_autocorr = if var > 1e-6 && pairs > 0 { (cov_sum / pairs as f64) / var } else { 0.0 };
-
-    // Count how many of the 8 dihedral symmetries preserve the wall pattern.
-    let wall_symmetries = (0..8)
-        .filter(|&t| {
-            (0..n).all(|i| {
-                let j = dihedral_idx(w, h, i, t);
-                (board.cells[i] == Cell::Blocked) == (board.cells[j] == Cell::Blocked)
-            })
-        })
-        .count();
-
-    // Combine into Visual Simplicity (0..100).
-    let cohesion_s = if walls == 0 {
-        50.0 // blank board is simple, though featureless
-    } else {
-        let dot_s = 100.0 * (1.0 - isolated_dot_ratio);
-        let c4_s = 100.0 - scale_0_100(comp4 as f64, 3.0, 12.0);
-        let c8_s = 100.0 - scale_0_100(comp8 as f64, 1.0, 8.0);
-        0.50 * dot_s + 0.30 * c4_s + 0.20 * c8_s
-    };
-
-    let geom_s = if walls == 0 {
-        50.0
-    } else {
-        let line_s = 100.0 * ortho_line_ratio;
-        let compact_s = 100.0 - scale_0_100(perimeter_per_wall, 2.4, 4.0);
-        0.55 * line_s + 0.45 * compact_s
-    };
-
-    let sym_s = match wall_symmetries {
-        8 => 100.0,
-        4 => 90.0,
-        2 => 68.0,
-        _ => 15.0,
-    };
-
-    let autocorr_s = scale_0_100(ortho_autocorr, -0.22, 0.45);
-    // Breathable wall density: sweet spot ~6 to 12 walls (9%–19% on 8x8); penalize overcrowded 16+ wall boards.
-    let density_s = trapezoid_0_100(p_wall, 0.04, 0.09, 0.19, 0.30);
-    let order_s = 0.55 * autocorr_s + 0.45 * density_s;
-
-    let score = 0.35 * cohesion_s + 0.30 * geom_s + 0.15 * sym_s + 0.20 * order_s;
-
-    SimplicityMetrics {
-        score,
-        walls,
-        playable,
-        components_4: comp4,
-        components_8: comp8,
-        isolated_dot_ratio,
-        ortho_line_ratio,
-        perimeter_per_wall,
-        wall_symmetries,
-        ortho_autocorr,
-    }
-}
-
-fn wall_components(board: &Board, dirs: &[(i32, i32)]) -> usize {
-    let (w, h) = (board.w, board.h);
-    let n = w * h;
-    let mut seen = vec![false; n];
-    let mut comps = 0;
-    for i in 0..n {
-        if board.cells[i] != Cell::Blocked || seen[i] {
-            continue;
-        }
-        comps += 1;
-        let mut q = VecDeque::new();
-        q.push_back(i);
-        seen[i] = true;
-        while let Some(u) = q.pop_front() {
-            let (ux, uy) = ((u % w) as i32, (u / w) as i32);
-            for &(dx, dy) in dirs {
-                let (nx, ny) = (ux + dx, uy + dy);
-                if nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32 {
-                    let v = ny as usize * w + nx as usize;
-                    if board.cells[v] == Cell::Blocked && !seen[v] {
-                        seen[v] = true;
-                        q.push_back(v);
-                    }
-                }
-            }
-        }
-    }
-    comps
-}
-
 /* ------------------------------------------------------------------ structural topology */
 
 struct Topology {
     mean_copy_degree: f64,
-    dead_ends: usize,
     cramped_ratio: f64,
     wall_jump_bridge_ratio: f64,
     copy_vs_jump_gap: f64,
@@ -444,9 +269,8 @@ fn eval_topology(board: &Board) -> Topology {
     let copy_dists: Vec<Vec<u16>> = (0..n).map(|s| bfs_dist(board, s, false)).collect();
     let move_dists: Vec<Vec<u16>> = (0..n).map(|s| bfs_dist(board, s, true)).collect();
 
-    // Copy degree distribution, dead ends, and cramped bottleneck cells.
+    // Copy degree distribution and cramped bottleneck cells.
     let mut degs = Vec::with_capacity(p_cnt);
-    let mut dead_ends = 0usize;
     let mut cramped_cells = 0usize;
     let mut total_jump_edges = 0usize;
     let mut wall_bridge_weight = 0.0f64;
@@ -457,15 +281,7 @@ fn eval_topology(board: &Board) -> Topology {
             .iter()
             .filter(|&&(dx, dy)| in_playable(board, ux + dx, uy + dy))
             .count();
-        let ortho_deg = ORTHO
-            .iter()
-            .filter(|&&(dx, dy)| in_playable(board, ux + dx, uy + dy))
-            .count();
         degs.push(deg as f64);
-        // Dead end / cul-de-sac: <= 2 copy exits or <= 1 orthogonal exit (excluding natural outer corners if open).
-        if deg <= 2 || ortho_deg <= 1 {
-            dead_ends += 1;
-        }
         if deg <= 3 {
             cramped_cells += 1;
         }
@@ -523,7 +339,6 @@ fn eval_topology(board: &Board) -> Topology {
 
     Topology {
         mean_copy_degree,
-        dead_ends,
         cramped_ratio,
         wall_jump_bridge_ratio,
         copy_vs_jump_gap,
@@ -1163,19 +978,18 @@ fn print_report(report: &PoolReport) {
 
     println!("=== BACTERIA BOARD EVALUATION ({SIM_GAMES} simulated games/board, depth {SIM_DEPTH}/{OPEN_DEPTH}) ===\n");
     println!(
-        "{:<10} {:>7} | {:>11} {:>9} {:>10} {:>10} | {:>5}  Closest Neighbor",
-        "Board", "OVERALL", "Interaction", "Diversity", "Simplicity", "Distinct", "Plies"
+        "{:<10} {:>7} | {:>11} {:>9} {:>10} | {:>5}  Closest Neighbor",
+        "Board", "OVERALL", "Interaction", "Diversity", "Distinct", "Plies"
     );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(82));
     for &i in &order {
         let b = &report.boards[i];
         println!(
-            "{:<10} {:>7.1} | {:>11.1} {:>9.1} {:>10.1} {:>10.1} | {:>5.1}  {} (dist {:.2}, layout {:.2})",
+            "{:<10} {:>7.1} | {:>11.1} {:>9.1} {:>10.1} | {:>5.1}  {} (dist {:.2}, layout {:.2})",
             b.name,
             b.overall,
             b.interaction.score,
             b.diversity.score,
-            b.simplicity.score,
             b.distinctness.score,
             b.avg_plies,
             b.distinctness.nearest_neighbor,
@@ -1189,10 +1003,9 @@ fn print_report(report: &PoolReport) {
         let b = &report.boards[i];
         let it = &b.interaction;
         let dv = &b.diversity;
-        let sm = &b.simplicity;
         println!("\n[{}] Overall {:.1}", b.name, b.overall);
         println!(
-            "  Interaction ({:4.1}): alive {:4.0}% | late-conv {:.2} | late-swings {:.1}/g | conv/mv {:.2} | non-greedy {:4.0}% | closeness {:4.0}% | wall-jumps {:4.1}% | dead-ends {} | avg-deg {:.2}",
+            "  Interaction ({:4.1}): alive {:4.0}% | late-conv {:.2} | late-swings {:.1}/g | conv/mv {:.2} | non-greedy {:4.0}% | closeness {:4.0}% | wall-jumps {:4.1}% | avg-deg {:.2}",
             it.score,
             it.alive_fraction * 100.0,
             it.late_conversions,
@@ -1201,7 +1014,6 @@ fn print_report(report: &PoolReport) {
             it.non_greedy_rate * 100.0,
             it.final_closeness * 100.0,
             it.wall_jump_rate * 100.0,
-            it.dead_ends,
             it.mean_copy_degree,
         );
         println!(
@@ -1214,19 +1026,6 @@ fn print_report(report: &PoolReport) {
             dv.start_eval_cells,
             dv.green_win_rate * 100.0,
             dv.multi_lane_score,
-        );
-        println!(
-            "  Simplicity  ({:4.1}): {} walls ({} playable) | comp4={} comp8={} | isolated dots {:4.0}% | ortho lines {:4.0}% | perim/wall {:.2} | sym={} | autocorr {:+.2}",
-            sm.score,
-            sm.walls,
-            sm.playable,
-            sm.components_4,
-            sm.components_8,
-            sm.isolated_dot_ratio * 100.0,
-            sm.ortho_line_ratio * 100.0,
-            sm.perimeter_per_wall,
-            sm.wall_symmetries,
-            sm.ortho_autocorr,
         );
         println!(
             "  Distinct    ({:4.1}): nearest={} (combined {:.2}, layout {:.2}, play {:.2}) | mean dist {:.2}",
@@ -1308,38 +1107,9 @@ mod tests {
     }
 
     #[test]
-    fn clean_shapes_beat_confetti_on_visual_simplicity() {
-        let atoll = eval_simplicity(&Board::parse(maps::MAPS[4].rows));
-        let compass = eval_simplicity(&Board::parse(maps::MAPS[5].rows));
-        let confetti = eval_simplicity(&Board::parse(&[
-            "R.......",
-            ".#...#..",
-            "..#.#...",
-            ".....#..",
-            "..#.....",
-            "...#.#..",
-            "..#...#.",
-            ".......G",
-        ]));
-        assert!(
-            atoll.score > confetti.score + 40.0,
-            "Atoll ({}) should beat confetti ({})",
-            atoll.score,
-            confetti.score
-        );
-        assert!(
-            compass.score > confetti.score + 40.0,
-            "Compass ({}) should beat confetti ({})",
-            compass.score,
-            confetti.score
-        );
-    }
-
-    #[test]
-    fn built_in_maps_have_zero_dead_ends_and_open_flow() {
+    fn built_in_maps_have_open_flow() {
         for map in maps::MAPS {
             let topo = eval_topology(&Board::parse(map.rows));
-            assert_eq!(topo.dead_ends, 0, "{} should have zero dead ends", map.name);
             assert!(topo.mean_copy_degree >= 5.0, "{} should stay open (got {:.2})", map.name, topo.mean_copy_degree);
         }
     }
