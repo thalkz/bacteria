@@ -2,6 +2,7 @@ mod ai;
 mod analysis;
 mod game;
 mod history;
+mod map_eval;
 mod maps;
 mod room;
 
@@ -29,6 +30,12 @@ const FAVICON: &str = include_str!("../static/favicon.svg");
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--eval-maps") {
+        map_eval::run_cli(&args[1..]);
+        return;
+    }
+
     let data = std::env::var_os("DATA_DIR").map_or_else(|| PathBuf::from("data"), PathBuf::from);
     let st: Shared = Arc::new(AppState::new(History::open(data)));
 

@@ -26,7 +26,7 @@ Open **Past games** (clock icon, top right), or **Review moves** at the end of a
 
 ## Rules
 
-The rules and the six 8x8 boards come from [noxio](https://github.com/thalkz/noxio).
+The rules come from [noxio](https://github.com/thalkz/noxio), played across six symmetric 8x8 boards.
 
 - Tap one of your bacteria, then an empty cell:
   - any neighbouring cell, diagonals included: the bacterium **copies** itself;
@@ -89,7 +89,8 @@ src/game.rs      rules: moves, conversions, end of game
 src/ai.rs        computer opponent (greedy / 2-ply / bitboard PVS with strategic eval & resignation)
 src/analysis.rs  grades every move of a finished game (same strategic engine, fixed depth 6)
 src/history.rs   finished games: data/games.jsonl, one JSON line per game, loaded at startup
-src/maps.rs      the six 8x8 boards from noxio
+src/maps.rs      the six symmetric 8x8 boards
+src/map_eval.rs  board quality evaluator (`cargo run --release -- --eval-maps`)
 src/room.rs      rooms, seats, move clock, rematches (all in memory)
 src/main.rs      HTTP + WebSocket server (axum), /api/history endpoints
 static/          the page: vanilla JS, no build step, embedded in the binary

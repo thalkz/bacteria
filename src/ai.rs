@@ -757,6 +757,25 @@ impl Search {
         self.negamax_fallback(board, p, depth, 1, alpha, beta)
     }
 
+    /// Evaluates every candidate move for `me` at `depth`, sorted best first.
+    pub(crate) fn score_moves(&mut self, board: &Board, me: Player, depth: u32) -> Vec<(Move, i32)> {
+        let mut moves = candidates(board, me);
+        order(board, me, &mut moves);
+        let mut out = Vec::with_capacity(moves.len());
+        for m in moves {
+            let mut b = board.clone();
+            b.apply(me, m);
+            let s = if depth <= 1 {
+                -self.negamax_board(&b, me.other(), 0, -INF, INF)
+            } else {
+                -self.negamax_board(&b, me.other(), depth - 1, -INF, INF)
+            };
+            out.push((m, s));
+        }
+        out.sort_by_key(|&(_, s)| -s);
+        out
+    }
+
     fn root_fast(&mut self, g: &Geom, board: &Board, me: Player, moves: &[Move], depth: u32) -> Option<(Move, i32)> {
         let (my, op) = g.bitboards(board, me);
         let my_is_green = me == Player::Green;
