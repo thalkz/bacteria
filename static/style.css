@@ -745,17 +745,6 @@ a.mode { color: inherit; text-decoration: none; }
 }
 .panel.low .bar i { background: var(--danger); }
 
-.scorebar {
-  display: flex;
-  gap: 2px;
-  height: 5px;
-  overflow: hidden;
-  border-radius: 3px;
-}
-.scorebar i { flex: 1 1 0; transition: flex-grow 0.5s ease; }
-.scorebar .g { background: var(--green); }
-.scorebar .r { background: var(--red); }
-
 .status-line {
   min-height: 22px;
   margin: 2px 0 0;
@@ -954,7 +943,55 @@ a.mode { color: inherit; text-decoration: none; }
 .player .swatch { width: 24px; height: 24px; --cell: 24px; }
 .player .count { font-size: 18px; }
 
-.replay-board { --reserve: 410px; }
+.evalbar {
+  position: relative;
+  height: 22px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--red);
+  user-select: none;
+}
+.evalbar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 50%;
+  background: var(--green);
+  transition: width 0.35s cubic-bezier(0.25, 0.9, 0.3, 1);
+}
+.evalbar-mid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+.evalbar-label {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.evalbar.side-g .evalbar-label { left: 8px; }
+.evalbar.side-r .evalbar-label { right: 8px; }
+.evalbar.pending { background: var(--surface); }
+.evalbar.pending .evalbar-fill { background: var(--surface-2); }
+.evalbar.pending .evalbar-label {
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--muted);
+  text-shadow: none;
+}
+
+.replay-board { --reserve: 428px; }
 
 .controls { display: flex; justify-content: center; gap: 6px; }
 .nav-btn {
@@ -1193,7 +1230,7 @@ kbd {
     gap: 20px;
     max-width: 1000px;
   }
-  .replay-board { --reserve: 250px; }
+  .replay-board { --reserve: 268px; }
   .replay-side { padding-top: 30px; }
 }
 

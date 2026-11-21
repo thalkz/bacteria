@@ -808,7 +808,6 @@ class GameView {
     app.innerHTML = `
       <section class="game">
         ${panelHTML(other(bottom))}
-        <div class="scorebar" aria-hidden="true"><i class="g"></i><i class="r"></i></div>
         <div class="board"></div>
         ${panelHTML(bottom)}
         <p class="status-line" aria-live="polite"></p>
@@ -828,7 +827,6 @@ class GameView {
         bar: $('.bar i', el),
       };
     }
-    this.scorebar = { g: $('.scorebar .g', root), r: $('.scorebar .r', root) };
     this.statusEl = $('.status-line', root);
     this.actions = $('.actions', root);
     this.modal = $('.modal', root);
@@ -876,8 +874,6 @@ class GameView {
         anim(el, 'bump');
       }
     }
-    this.scorebar.g.style.flexGrow = s.scores.green;
-    this.scorebar.r.style.flexGrow = s.scores.red;
   }
 
   markLast(cells) {
@@ -1156,7 +1152,6 @@ const isJump = (w, from, to) =>
 const moveName = (m, w, h) => (isJump(w, m.from, m.to) ? `${sq(m.from, w, h)}–${sq(m.to, w, h)}` : sq(m.to, w, h));
 /** Turn number as in the move list: "12." before Green's move, "12…" before Red's. */
 const turnOf = k => `${Math.floor(k / 2) + 1}${k % 2 ? '…' : '.'}`;
-const signed = n => (n > 0 ? '+' : n < 0 ? '−' : '') + Math.abs(n);
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 const rtf = typeof Intl !== 'undefined' && Intl.RelativeTimeFormat ? new Intl.RelativeTimeFormat('en', { numeric: 'auto' }) : null;
@@ -1215,7 +1210,8 @@ function resultOf(rec) {
   if (w && me) { title = w === me ? 'You won' : 'You lost'; tone = w === me ? 'win' : 'lose'; }
   else if (w) { title = `${NAME[w]} won`; tone = w; }
   const loser = w && other(w);
-  const how = rec.reason === 'timeout' ? `${NAME[loser]} ran out of time` : rec.reason === 'resign' ? `${NAME[loser]} resigned` : '';
+  const loserName = loser ? playerName(rec, loser) : '';
+  const how = rec.reason === 'timeout' ? `${loserName} ran out of time` : rec.reason === 'resign' ? `${loserName} resigned` : '';
   const short = { timeout: 'on time', resign: 'resigned' }[rec.reason] || '';
   return { title, tone, how, short };
 }
@@ -1423,7 +1419,11 @@ class ReplayView {
             <span class="muted">${MODE_NAME[rec.mode]} · ${rec.map} · ${ago(rec.ended_at)}</span>
           </div>
           <div class="players">${player('green')}${player('red')}</div>
-          <div class="scorebar" aria-hidden="true"><i class="g"></i><i class="r"></i></div>
+          <div class="evalbar pending" role="img" aria-label="Engine win score">
+            <div class="evalbar-fill"></div>
+            <span class="evalbar-mid" aria-hidden="true"></span>
+            <span class="evalbar-label">…</span>
+          </div>
           <div class="board replay-board"></div>
           <div class="controls">
             ${nav('first', 'First position')}${nav('prev', 'Previous move')}
@@ -1448,7 +1448,11 @@ class ReplayView {
     this.board.setup(rec.w, rec.h, rec.start, true);
     this.board.sync(rec.start);
     this.counts = { green: $('.player[data-c="green"] .count', root), red: $('.player[data-c="red"] .count', root) };
-    this.scorebar = { g: $('.scorebar .g', root), r: $('.scorebar .r', root) };
+    this.evalbar = {
+      root: $('.evalbar', root),
+      fill: $('.evalbar-fill', root),
+      label: $('.evalbar-label', root),
+    };
     this.insightEl = $('.insight', root);
     this.chartEl = $('.chart', root);
     this.summaryEl = $('.summary', root);
@@ -1587,6 +1591,7 @@ class ReplayView {
     this.paintBoardMarks();
     this.mark('last', []);
     this.drawArrows(reply ? [best, { ...reply, reply: true }] : [best]);
+    this.paintEvalBar();
     this.paintInsight();
   }
 
@@ -1595,6 +1600,39 @@ class ReplayView {
     (this.marked[cls] || []).forEach(i => els[i] && els[i].classList.remove(cls));
     this.marked[cls] = cells;
     cells.forEach(i => els[i].classList.add(cls));
+  }
+
+  /* --- win score helpers --- */
+
+  winProb(score) {
+    const a = this.analysis;
+    const win = a ? a.win : 40000;
+    const k = (a && a.win_k) || 0.0038;
+    if (score >= win) return 1;
+    if (score <= -win) return 0;
+    return 1 / (1 + Math.exp(-k * score));
+  }
+
+  /** Engine score formatted like a chess engine ("+2.4", "−1.8", "0.0", "Forced win"). */
+  fmtScore(score) {
+    const a = this.analysis;
+    const win = a ? a.win : 40000;
+    const scale = (a && a.scale) || 100;
+    if (score >= win) return 'Forced win';
+    if (score <= -win) return 'Forced loss';
+    const v = score / scale;
+    if (Math.abs(v) < 0.05) return '0.0';
+    return (v > 0 ? '+' : '−') + Math.abs(v).toFixed(1);
+  }
+
+  /** Green's engine score after `p` moves (0 = start of game). */
+  greenScoreAt(p) {
+    const a = this.analysis;
+    if (!a || !a.moves.length) return null;
+    if (p <= 0) return a.moves[0].top[0].score;
+    const k = Math.min(p, a.moves.length) - 1;
+    const s = a.moves[k].score;
+    return this.moves[k].by === 'green' ? s : -s;
   }
 
   /* --- painting --- */
@@ -1608,8 +1646,7 @@ class ReplayView {
       const toMove = this.ply < this.moves.length && this.moves[this.ply].by === c;
       $(`.player[data-c="${c}"]`).classList.toggle('active', toMove);
     }
-    this.scorebar.g.style.flexGrow = scores.green;
-    this.scorebar.r.style.flexGrow = scores.red;
+    this.paintEvalBar();
     setHTML(this.plyEl, this.ply ? `${this.ply} / ${this.moves.length}` : `Start · ${plural(this.moves.length, 'move')}`);
     this.paintControls();
     this.listEl.querySelectorAll('[aria-current]').forEach(el => el.removeAttribute('aria-current'));
@@ -1626,6 +1663,39 @@ class ReplayView {
     this.paintBoardMarks();
     this.paintCursor();
     setHTML(this.summaryEl, this.summaryHTML());
+  }
+
+  paintEvalBar() {
+    const eb = this.evalbar;
+    if (!eb) return;
+    const a = this.analysis;
+    if (!a || !a.moves.length) {
+      eb.root.classList.add('pending');
+      eb.root.classList.remove('side-g', 'side-r');
+      eb.fill.style.width = '50%';
+      eb.label.textContent = this.analysisFailed ? '–' : '…';
+      return;
+    }
+    let gScore;
+    if (this.variation) {
+      const k = this.variation.k;
+      const bs = a.moves[k].top[0].score;
+      gScore = this.moves[k].by === 'green' ? bs : -bs;
+    } else {
+      gScore = this.greenScoreAt(this.ply);
+    }
+    const win = a.win;
+    const wp = this.winProb(gScore);
+    const pct = gScore >= win ? 100 : gScore <= -win ? 0 : Math.max(4, Math.min(96, wp * 100));
+    const greenSide = gScore >= 0;
+    const text = Math.abs(gScore) >= win ? 'Forced win' : this.fmtScore(gScore);
+    eb.root.classList.remove('pending');
+    eb.root.classList.toggle('side-g', greenSide);
+    eb.root.classList.toggle('side-r', !greenSide);
+    eb.fill.style.width = pct.toFixed(1) + '%';
+    eb.label.textContent = text;
+    const who = gScore >= win ? 'Green forced win' : gScore <= -win ? 'Red forced win' : Math.abs(gScore) < 5 ? 'Even (0.0)' : `${greenSide ? 'Green' : 'Red'} ${text}`;
+    eb.root.setAttribute('aria-label', `Win score: ${who}`);
   }
 
   /** On the board: the grade of the move just played, and an arrow to the better move if there was one. */
@@ -1736,7 +1806,7 @@ class ReplayView {
     return `
       <div class="insight-head"><b>Start</b></div>
       <p>Green moves first. Step through the game with <kbd>←</kbd> <kbd>→</kbd> or the buttons, or tap a move in the list.</p>
-      <p class="muted">Each move is compared with the best one by looking ${depth} moves ahead (${depth / 2} each) and counting the lead: your cells minus theirs.</p>
+      <p class="muted">Each move is evaluated ${depth} moves ahead (${depth / 2} each) with a chess-style win score weighing cells, territory, mobility, and safety.</p>
       <p class="muted">
         <span class="q q-best">★</span> best, <span class="q q-good">✓</span> good, <span class="q q-inaccuracy">?!</span> inaccuracy,
         <span class="q q-mistake">?</span> mistake, <span class="q q-blunder">??</span> blunder.</p>
@@ -1793,7 +1863,7 @@ class ReplayView {
     html += `
       <p class="verdict"><span class="arrow-key" aria-hidden="true"></span>Better: <button type="button" class="mvlink" data-act="best">${moveName(best, w, h)}</button>, which ${this.describe(c, before, best.from, best.to)}.</p>
       <table class="compare">
-        <tr><th></th><th>${NAME[c]}’s lead ${this.analysis.depth} moves later</th></tr>
+        <tr><th></th><th>Win score (${NAME[c]}’s view)</th></tr>
         <tr><td>Played ${moveName(m, w, h)}</td><td>${this.outlook(a.score)}</td></tr>
         <tr><td>Best ${moveName(best, w, h)}</td><td>${this.outlook(best.score)}</td></tr>
       </table>
@@ -1803,10 +1873,7 @@ class ReplayView {
   }
 
   outlook(score) {
-    const win = this.analysis.win;
-    if (score >= win) return '<b>wins by force</b>';
-    if (score <= -win) return '<b>loses by force</b>';
-    return `<b>${signed(score)}</b>`;
+    return `<b>${this.fmtScore(score)}</b>`;
   }
 
   /** One lesson that fits what went wrong. */
@@ -1835,7 +1902,7 @@ class ReplayView {
       return 'Jumping out of a group leaves a hole beside your bacteria. The opponent lands in it and converts them.';
     }
     if (m.jump && !bestJump && m.converted.length <= bestConv) {
-      return 'A jump costs a cell: it leaves a hole behind. Jump only when it converts more than any copy can.';
+      return 'A jump costs a cell and leaves a hole behind. Jump only when it converts more or claims crucial territory.';
     }
     if (replyConv >= 3 && bestReplyConv < replyConv) {
       return 'Before moving, check what the opponent takes back. An empty cell touching several of your bacteria is a target.';
@@ -1843,6 +1910,12 @@ class ReplayView {
     if (bestConv > m.converted.length) return 'Look at every capture first: the best move converted more right away.';
     if (bestConv < m.converted.length && bestReplyConv < replyConv) {
       return 'Taking the most right now isn’t always best: the best move converts less but leaves the opponent less to take back.';
+    }
+    if (bestConv === 0 && m.converted.length === 0 && bestJump) {
+      return 'Jumping ahead claims open space and cuts off territory before the opponent can reach it.';
+    }
+    if (bestConv === 0 && m.converted.length === 0) {
+      return 'The better move claims more open space and stronger territory control for the moves ahead.';
     }
     return 'The difference shows a few moves later. Tap “Show the best move” to see the line.';
   }
@@ -1858,7 +1931,7 @@ class ReplayView {
       <p><span class="arrow-key" aria-hidden="true"></span>${NAME[c]} ${this.describe(c, { w, h, cells: v.before }, v.first.from, v.first.to)}.</p>
       ${r ? `<p><span class="arrow-key reply" aria-hidden="true"></span>${NAME[r.by]}’s best answer, <b>${moveName(r, w, h)}</b>, converts ${r.converted.length ? `<b>${r.converted.length}</b>` : 'nothing'}.</p>` : ''}
       ${v.first.filled.length ? `<p>${NAME[other(c)]} is stuck: ${NAME[c]} takes every empty cell and wins.</p>` : ''}
-      <p class="muted">${NAME[c]}’s lead ${this.analysis.depth} moves later: ${this.outlook(a.top[0].score)} instead of ${this.outlook(a.score)}.</p>
+      <p class="muted">Win score for ${NAME[c]}: ${this.outlook(a.top[0].score)} instead of ${this.outlook(a.score)}.</p>
       <div class="row">
         <button type="button" class="btn ghost small" data-act="best">Replay</button>
         <button type="button" class="btn small" data-act="back">Back to the game</button>
@@ -1868,9 +1941,8 @@ class ReplayView {
   /* --- advantage chart --- */
 
   /**
-   * Green's lead after each move, as the analysis sees it. Index 0 is the start.
-   * Each score ends on the opponent's answer, so on its own the curve zigzags:
-   * averaging two moves in a row cancels that out.
+   * Green's engine win score at each ply (index 0 = start), mapped through a sigmoid
+   * onto [-1, +1] so balanced-game swings read clearly and forced wins reach the edges.
    */
   evals() {
     const a = this.analysis;
@@ -1878,13 +1950,10 @@ class ReplayView {
     const win = a.win;
     const raw = [a.moves[0].top[0].score];
     a.moves.forEach((m, k) => raw.push(this.moves[k].by === 'green' ? m.score : -m.score));
-    const plain = raw.filter(v => Math.abs(v) < win).map(Math.abs);
-    const cap = Math.max(6, ...plain);
-    // A decided game counts as a big lead, so it doesn't swamp the average.
-    const v = raw.map(x => (Math.abs(x) >= win ? Math.sign(x) * (cap + 2) : x));
-    return raw.map((x, p) => ({
-      value: p ? (v[p - 1] + v[p]) / 2 : v[0],
-      decided: Math.abs(x) >= win ? Math.sign(x) : 0,
+    return raw.map(score => ({
+      score,
+      unit: 2 * this.winProb(score) - 1,
+      decided: Math.abs(score) >= win ? Math.sign(score) : 0,
     }));
   }
 
@@ -1892,27 +1961,25 @@ class ReplayView {
     const evals = this.evals();
     const el = this.chartEl;
     if (!evals || !el) { if (el) el.innerHTML = ''; return; }
-    const vals = evals.map(e => e.value);
-    const n = vals.length - 1;
-    const max = Math.max(6, ...vals.map(Math.abs));
+    const n = evals.length - 1;
     const W = Math.max(200, el.clientWidth);
-    const H = 84;
+    const H = 88;
     const pad = 7;
     const mid = H / 2;
     const x = p => pad + (n ? p / n : 0) * (W - 2 * pad);
-    const y = v => mid - (Math.max(-max, Math.min(max, v)) / max) * (mid - pad);
+    const y = u => mid - Math.max(-1, Math.min(1, u)) * (mid - pad);
     this.chartX = x;
     this.chartN = n;
     this.chartPad = pad;
-    const pts = vals.map((v, p) => `${x(p).toFixed(1)},${y(v).toFixed(1)}`);
+    const pts = evals.map((e, p) => `${x(p).toFixed(1)},${y(e.unit).toFixed(1)}`);
     const line = 'M' + pts.join('L');
     const area = `${line}L${x(n).toFixed(1)},${mid}L${x(0).toFixed(1)},${mid}Z`;
     const dots = this.analysis.moves.map((m, k) => (m.class === 'mistake' || m.class === 'blunder')
-      ? `<circle class="dot q-${m.class}" cx="${x(k + 1).toFixed(1)}" cy="${y(vals[k + 1]).toFixed(1)}" r="4.5"/>` : '').join('');
+      ? `<circle class="dot q-${m.class}" cx="${x(k + 1).toFixed(1)}" cy="${y(evals[k + 1].unit).toFixed(1)}" r="4.5"/>` : '').join('');
     el.innerHTML = `
       <div class="chart-head"><b>Advantage</b><span class="muted"><span class="key g"></span>Green ahead <span class="key r"></span>Red ahead</span></div>
       <div class="chart-plot">
-        <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Score gap after each move. Mistakes and blunders are marked.">
+        <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Engine win score after each move. Mistakes and blunders are marked.">
           <defs>
             <clipPath id="clip-up"><rect x="0" y="0" width="${W}" height="${mid}"/></clipPath>
             <clipPath id="clip-down"><rect x="0" y="${mid}" width="${W}" height="${mid}"/></clipPath>
@@ -1950,8 +2017,13 @@ class ReplayView {
   }
 
   chartTip(p, e) {
-    const v = Math.round(e.value);
-    const lead = e.decided ? `${e.decided > 0 ? 'Green' : 'Red'} wins by force` : v === 0 ? 'Even' : `${v > 0 ? 'Green' : 'Red'} ${signed(Math.abs(v))}`;
+    let lead;
+    if (e.decided > 0) lead = 'Forced win (Green)';
+    else if (e.decided < 0) lead = 'Forced win (Red)';
+    else {
+      const txt = this.fmtScore(e.score);
+      lead = txt === '0.0' ? '0.0 · Even' : `${txt} (${e.score > 0 ? 'Green' : 'Red'})`;
+    }
     if (!p) return `<b>Start</b> · ${lead}`;
     const m = this.moves[p - 1];
     const g = GRADES[this.analysis.moves[p - 1].class];

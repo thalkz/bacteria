@@ -130,6 +130,12 @@ pub struct Room {
     rematch: [bool; 2],
     next: Option<String>,
     last_activity: Instant,
+    /// Board hashes seen so far in this game (for repetition detection by the AI).
+    board_hashes: Vec<u64>,
+    /// Per-player piece-mask hashes seen so far (catches back-and-forth jumping while opponent plays elsewhere).
+    side_hashes: [Vec<u64>; 2],
+    /// Consecutive AI turns evaluated as hopelessly lost.
+    ai_hopeless: u8,
 }
 
 /// Creates a room for its creator. Returns `(room id, creator token)`.
@@ -160,6 +166,11 @@ fn insert(st: &Shared, rooms: &mut HashMap<String, Room>, mode: Mode, seats: [Se
         }
     };
     let (map, board) = maps::random();
+    let start_hash = ai::board_hash(&board);
+    let start_sides = [
+        vec![ai::side_hash(&board, Player::Green)],
+        vec![ai::side_hash(&board, Player::Red)],
+    ];
     let mut room = Room {
         id: id.clone(),
         mode,
@@ -174,6 +185,9 @@ fn insert(st: &Shared, rooms: &mut HashMap<String, Room>, mode: Mode, seats: [Se
         rematch: [false; 2],
         next: None,
         last_activity: Instant::now(),
+        board_hashes: vec![start_hash],
+        side_hashes: start_sides,
+        ai_hopeless: 0,
     };
     room.start_if_ready(st);
     rooms.insert(id.clone(), room);
@@ -357,18 +371,38 @@ impl Room {
         let me = self.game.turn;
         if let (Mode::Solo(level), true) = (self.mode, self.seats[me.idx()].ai) {
             let board = self.game.board.clone();
+            let ply = self.game.ply;
+            let history = ai::History {
+                boards: self.board_hashes.clone(),
+                my_sides: self.side_hashes[me.idx()].clone(),
+            };
+            let hopeless = self.ai_hopeless;
             let (st, id) = (st.clone(), self.id.clone());
             tokio::spawn(async move {
                 let started = Instant::now();
-                let mv = tokio::task::spawn_blocking(move || ai::choose(&board, me, level)).await.ok().flatten();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    ai::decide(&board, me, level, ply, &history, hopeless)
+                })
+                .await
+                .ok()
+                .flatten();
                 if let Some(rest) = AI_MIN_DELAY.checked_sub(started.elapsed()) {
                     tokio::time::sleep(rest).await;
                 }
-                let Some(mv) = mv else { return };
+                let Some(outcome) = outcome else { return };
                 let mut rooms = st.rooms.lock().unwrap();
                 if let Some(room) = rooms.get_mut(&id) {
                     if room.seq == seq {
-                        let _ = room.play(&st, me, mv);
+                        room.ai_hopeless = outcome.hopeless_streak;
+                        match outcome.decision {
+                            ai::Decision::Move(mv) => {
+                                let _ = room.play(&st, me, mv);
+                            }
+                            ai::Decision::Resign => {
+                                room.finish(&st, Some(me.other()), Reason::Resign);
+                                room.broadcast();
+                            }
+                        }
                     }
                 }
             });
@@ -380,6 +414,8 @@ impl Room {
             return Err("game is not running");
         }
         self.game.play(p, m)?;
+        self.board_hashes.push(ai::board_hash(&self.game.board));
+        self.side_hashes[p.idx()].push(ai::side_hash(&self.game.board, p));
         self.last_activity = Instant::now();
         if self.game.over {
             self.finish(st, self.game.leader(), Reason::Score);

@@ -16,12 +16,12 @@ Open **Past games** (clock icon, top right), or **Review moves** at the end of a
 - Step through with `←` `→` (`Home`/`End`, `Space` to autoplay), or tap a move in the list.
 - Moves are written like chess: files `a`–`h` from the left, ranks `1`–`8` from the bottom.
   A copy is just its target (`d4`, any neighbour gives the same board); a jump is `b2–b4`. `×3` means it converted 3.
-- Each move is graded against the best one, looking 6 moves ahead (3 each) and counting the lead (your cells minus theirs):
-  ★ best, ✓ good, ?! inaccuracy (3–5 cells worse), ? mistake (6–10), ?? blunder (more, or a won game let slip).
+- Each move is evaluated 6 moves ahead (3 each) with a chess-style win score weighing cells, territory, mobility, and safety, and graded by win-chance drop:
+  ★ best, ✓ good, ?! inaccuracy, ? mistake, ?? blunder.
 - On the board, a badge on the move just played shows its grade, and a blue arrow shows the better move.
 - The panel says what the move did, the opponent's best answer, the better move and a tip.
   **Show the best move** plays the better move and the answer to it on the board.
-- The chart shows who was ahead after each move. Tap it to jump there. The counts under it jump to your next mistake.
+- The win-score bar above the board and the Advantage chart show who was winning after each move. Tap the chart to jump there. The counts under it jump to your next mistake.
 - **My games** lists the games played in this browser. There are no accounts: every game is public, at `/r/<id>`.
 
 ## Rules
@@ -86,8 +86,8 @@ To build on a Mac for an x86 VPS: `docker buildx build --platform linux/amd64 -t
 
 ```
 src/game.rs      rules: moves, conversions, end of game
-src/ai.rs        computer opponent (greedy / 2-ply / timed alpha-beta)
-src/analysis.rs  grades every move of a finished game (same alpha-beta, fixed depth 6)
+src/ai.rs        computer opponent (greedy / 2-ply / bitboard PVS with strategic eval & resignation)
+src/analysis.rs  grades every move of a finished game (same strategic engine, fixed depth 6)
 src/history.rs   finished games: data/games.jsonl, one JSON line per game, loaded at startup
 src/maps.rs      the six 8x8 boards from noxio
 src/room.rs      rooms, seats, move clock, rematches (all in memory)
