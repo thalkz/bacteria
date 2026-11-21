@@ -1,11 +1,14 @@
 //! Move-by-move analysis of a finished game, to learn from it.
 //!
 //! Every move is compared with the best ones a fixed-depth search finds (the hard
-//! computer's alpha-beta, without its time limit), so an analysis never changes.
-//! Scores are cell differences, mine minus theirs, after `DEPTH` moves of best play
-//! from both sides. Beyond ±`WIN` the game is decided: someone ends up stuck.
+//! computer's bitboard alpha-beta with strategic evaluation, without its time limit),
+//! so an analysis is deterministic.
+//!
+//! Scores are in centi-cells (`SCALE = 100` = 1.00 cell equivalent), weighing
+//! material, territory control, mobility, and piece safety. Beyond ±`WIN` the game
+//! is decided by force. Moves are graded by win-probability drop, like chess engines.
 
-use crate::ai::{self, Search, INF, WIN};
+use crate::ai::{self, Search, INF, SCALE, WIN, WIN_PROB_K};
 use crate::game::{Board, Game, Move, Player};
 use crate::history::Record;
 use serde::Serialize;
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 /// Three moves each. Ending on the opponent's answer means a move isn't praised
-/// for a capture that gets taken right back. About a second for a whole game.
+/// for a capture that gets taken right back.
 #[cfg(not(test))]
 pub const DEPTH: u32 = 6;
 #[cfg(test)]
@@ -49,9 +52,9 @@ pub struct Scored {
 #[derive(Debug, Serialize)]
 pub struct MoveAnalysis {
     pub class: Class,
-    /// Score of the move played, for the player who made it.
+    /// Engine score of the move played, in centi-cells, for the player who made it.
     pub score: i32,
-    /// How much worse it is than the best move. 0 when it is the best.
+    /// How much worse it is than the best move, in centi-cells. 0 when it is the best.
     pub loss: i32,
     /// Different moves available. Copies to the same cell count once: they give the same board.
     pub choices: usize,
@@ -66,21 +69,24 @@ pub struct MoveAnalysis {
 pub struct Analysis {
     pub depth: u32,
     pub win: i32,
+    pub scale: i32,
+    pub win_k: f64,
     pub moves: Vec<MoveAnalysis>,
 }
 
 pub fn analyse(start: Board, moves: &[Move]) -> Analysis {
     let mut game = Game::new(start);
     let mut out = Vec::with_capacity(moves.len());
+    let mut search = Search::new(None);
     for &m in moves {
         let me = game.turn;
         if !game.board.is_legal(me, m) {
             break; // not a real game: analyse what makes sense
         }
-        out.push(analyse_move(&game.board, me, m));
+        out.push(analyse_move(&mut search, &game.board, me, m));
         game.play(me, m).expect("legal move");
     }
-    Analysis { depth: DEPTH, win: WIN, moves: out }
+    Analysis { depth: DEPTH, win: WIN, scale: SCALE, win_k: WIN_PROB_K, moves: out }
 }
 
 /// Two moves give the same board: same move, or copies to the same cell.
@@ -88,26 +94,25 @@ fn same(board: &Board, a: Move, b: Move) -> bool {
     a == b || (a.to == b.to && !board.is_jump(a) && !board.is_jump(b))
 }
 
-fn analyse_move(board: &Board, me: Player, played: Move) -> MoveAnalysis {
+fn analyse_move(search: &mut Search, board: &Board, me: Player, played: Move) -> MoveAnalysis {
     let mut moves = vec![played];
     moves.extend(ai::candidates(board, me).into_iter().filter(|&m| !same(board, m, played)));
     ai::order(board, me, &mut moves[1..]);
 
     // Exact scores for the move played (searched first) and the `TOP` best. Any other
     // move only needs to be proven worse than the current `TOP`-th, which prunes a lot.
-    let mut search = Search::new(None);
     let mut scored: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
     for (k, &m) in moves.iter().enumerate() {
         let beta = if k == 0 { INF } else { 1 - kth_best(&scored, TOP) };
         let mut b = board.clone();
         b.apply(me, m);
-        scored.push((m, -search.negamax(&b, me.other(), DEPTH - 1, -INF, beta)));
+        scored.push((m, -search.negamax_board(&b, me.other(), DEPTH - 1, -INF, beta)));
     }
 
     let score = scored[0].1;
     scored.sort_by_key(|&(_, v)| -v); // stable: the move played stays first among equals
     let (best, best_score) = scored[0];
-    let reply = answer(board, me, played);
+    let reply = answer(search, board, me, played);
     MoveAnalysis {
         class: classify(moves.len(), best_score, score),
         score,
@@ -115,7 +120,7 @@ fn analyse_move(board: &Board, me: Player, played: Move) -> MoveAnalysis {
         choices: moves.len(),
         top: scored.iter().take(TOP).map(|&(m, score)| Scored { from: m.from, to: m.to, score }).collect(),
         reply,
-        best_reply: if same(board, best, played) { reply } else { answer(board, me, best) },
+        best_reply: if same(board, best, played) { reply } else { answer(search, board, me, best) },
     }
 }
 
@@ -129,15 +134,19 @@ fn kth_best(scored: &[(Move, i32)], k: usize) -> i32 {
 }
 
 /// The opponent's best answer to `m`, seen from the same horizon as the scores.
-fn answer(board: &Board, me: Player, m: Move) -> Option<Move> {
+fn answer(search: &mut Search, board: &Board, me: Player, m: Move) -> Option<Move> {
     let mut b = board.clone();
     b.apply(me, m);
     let them = me.other();
     let mut moves = ai::candidates(&b, them);
+    if moves.is_empty() {
+        return None;
+    }
     ai::order(&b, them, &mut moves);
-    Search::new(None).root(&b, them, &moves, DEPTH - 1).map(|(m, _)| m)
+    search.root(&b, them, &moves, DEPTH - 1).map(|(m, _)| m)
 }
 
+/// Classifies a move by win-probability drop (chess-engine style).
 fn classify(choices: usize, best: i32, played: i32) -> Class {
     if choices == 1 {
         return Class::Forced;
@@ -145,18 +154,15 @@ fn classify(choices: usize, best: i32, played: i32) -> Class {
     if played >= best {
         return Class::Best;
     }
-    let decided = |v: i32| v.abs() >= WIN;
-    if decided(best) && decided(played) && best.signum() == played.signum() {
-        return Class::Good; // won (or lost) either way, only the margin changes
-    }
-    if decided(best) || decided(played) {
-        return Class::Blunder; // let a won game slip, or walked into a lost one
-    }
-    match best - played {
-        1..=2 => Class::Good,
-        3..=5 => Class::Inaccuracy,
-        6..=10 => Class::Mistake,
-        _ => Class::Blunder,
+    let drop = (ai::win_prob(best) - ai::win_prob(played)).max(0.0);
+    if drop < 0.05 {
+        Class::Good
+    } else if drop < 0.10 {
+        Class::Inaccuracy
+    } else if drop < 0.20 {
+        Class::Mistake
+    } else {
+        Class::Blunder
     }
 }
 
@@ -241,13 +247,21 @@ mod tests {
 
     #[test]
     fn grades() {
-        assert_eq!(classify(5, 4, 4), Class::Best);
-        assert_eq!(classify(5, 4, 2), Class::Good);
-        assert_eq!(classify(5, 4, 0), Class::Inaccuracy);
-        assert_eq!(classify(5, 4, -4), Class::Mistake);
-        assert_eq!(classify(5, 4, -20), Class::Blunder);
-        assert_eq!(classify(5, WIN + 3, 9), Class::Blunder);
-        assert_eq!(classify(5, WIN + 9, WIN + 3), Class::Good);
+        assert_eq!(classify(5, 100, 100), Class::Best);
+        // Small dip around even: < 5% win-prob drop -> Good
+        assert_eq!(classify(5, 0, -40), Class::Good);
+        // ~7.5% win-prob drop -> Inaccuracy
+        assert_eq!(classify(5, 0, -80), Class::Inaccuracy);
+        // ~14% win-prob drop -> Mistake
+        assert_eq!(classify(5, 0, -150), Class::Mistake);
+        // >20% win-prob drop -> Blunder
+        assert_eq!(classify(5, 0, -260), Class::Blunder);
+        // Throwing away a forced win into a small lead -> Blunder
+        assert_eq!(classify(5, WIN + 300, 200), Class::Blunder);
+        // Forced win to forced win (smaller margin) -> Good
+        assert_eq!(classify(5, WIN + 900, WIN + 300), Class::Good);
+        // Already overwhelmingly winning (+20.0 -> +15.0) -> still Good
+        assert_eq!(classify(5, 2000, 1500), Class::Good);
     }
 
     #[test]
