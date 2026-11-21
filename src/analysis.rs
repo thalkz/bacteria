@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-/// Three moves each. Ending on the opponent's answer means a move isn't praised
-/// for a capture that gets taken right back.
+/// Base search depth from the root (three moves each). Each candidate in the
+/// shortlist is paired with one extra ply (`DEPTH` + `DEPTH + 1`) so odd and even
+/// horizons cancel out instead of swinging each turn.
 #[cfg(not(test))]
 pub const DEPTH: u32 = 6;
 #[cfg(test)]
@@ -25,6 +26,9 @@ pub const DEPTH: u32 = 4;
 const _: () = assert!(DEPTH >= 2);
 /// Moves listed per position, best first.
 const TOP: usize = 3;
+/// Top moves from the base depth pass promoted to the paired-depth pass.
+const SHORTLIST: usize = 6;
+const _: () = assert!(SHORTLIST >= TOP);
 /// Analyses kept in memory.
 const CACHE: usize = 256;
 /// Analyses computed at the same time (each one keeps a CPU busy).
@@ -77,7 +81,7 @@ pub struct Analysis {
 pub fn analyse(start: Board, moves: &[Move]) -> Analysis {
     let mut game = Game::new(start);
     let mut out = Vec::with_capacity(moves.len());
-    let mut search = Search::new(None);
+    let mut search = Search::for_analysis();
     for &m in moves {
         let me = game.turn;
         if !game.board.is_legal(me, m) {
@@ -94,23 +98,66 @@ fn same(board: &Board, a: Move, b: Move) -> bool {
     a == b || (a.to == b.to && !board.is_jump(a) && !board.is_jump(b))
 }
 
+/// Combines consecutive even/odd depth evaluations to cancel last-mover horizon
+/// bias while trusting the deeper search whenever a forced outcome appears.
+fn combine(shallow: i32, deep: i32) -> i32 {
+    if deep.abs() >= WIN || shallow.abs() >= WIN {
+        deep
+    } else {
+        (shallow + deep) / 2
+    }
+}
+
 fn analyse_move(search: &mut Search, board: &Board, me: Player, played: Move) -> MoveAnalysis {
     let mut moves = vec![played];
     moves.extend(ai::candidates(board, me).into_iter().filter(|&m| !same(board, m, played)));
     ai::order(board, me, &mut moves[1..]);
 
-    // Exact scores for the move played (searched first) and the `TOP` best. Any other
-    // move only needs to be proven worse than the current `TOP`-th, which prunes a lot.
-    let mut scored: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
+    // Pass 1 (depth DEPTH - 1 after the move = DEPTH total): exact scores for the
+    // played move and the top `SHORTLIST` candidates.
+    let mut pass1: Vec<(Move, i32)> = Vec::with_capacity(moves.len());
     for (k, &m) in moves.iter().enumerate() {
-        let beta = if k == 0 { INF } else { 1 - kth_best(&scored, TOP) };
+        let beta = if k == 0 || pass1.len() < SHORTLIST { INF } else { 1 - kth_best(&pass1, SHORTLIST) };
         let mut b = board.clone();
         b.apply(me, m);
-        scored.push((m, -search.negamax_board(&b, me.other(), DEPTH - 1, -INF, beta)));
+        pass1.push((m, -search.negamax_board(&b, me.other(), DEPTH - 1, -INF, beta)));
     }
 
-    let score = scored[0].1;
-    scored.sort_by_key(|&(_, v)| -v); // stable: the move played stays first among equals
+    // Build shortlist: top `SHORTLIST` moves best-first (for tight pruning in Pass 2),
+    // always guaranteeing the played move is included.
+    let played_p1 = pass1[0];
+    let mut shortlist = pass1;
+    shortlist.sort_by_key(|&(_, v)| -v); // stable: played stays ahead of ties
+    shortlist.truncate(SHORTLIST);
+    if !shortlist.iter().any(|&(m, _)| m == played) {
+        shortlist.push(played_p1);
+    }
+
+    // Pass 2 (depth DEPTH after the move = DEPTH + 1 total): pair with Pass 1 to cancel
+    // odd/even horizon swings. Exact scores for `played` and the `TOP` best paired moves.
+    let mut scored: Vec<(Move, i32)> = Vec::with_capacity(shortlist.len());
+    for &(m, s_shallow) in &shortlist {
+        let is_played = m == played;
+        let beta = if is_played || scored.len() < TOP {
+            INF
+        } else {
+            let thr = kth_best(&scored, TOP);
+            let need_deep = if thr >= WIN || s_shallow.abs() >= WIN {
+                thr
+            } else {
+                (2 * thr - s_shallow - 1).min(WIN).clamp(-INF, INF)
+            };
+            (1 - need_deep).clamp(-INF, INF)
+        };
+        let mut b = board.clone();
+        b.apply(me, m);
+        let s_deep = -search.negamax_board(&b, me.other(), DEPTH, -INF, beta);
+        scored.push((m, combine(s_shallow, s_deep)));
+    }
+
+    let score = scored.iter().find(|&&(m, _)| m == played).unwrap().1;
+    // Best first; the move played wins ties so it is graded Best with loss 0.
+    scored.sort_by_key(|&(m, v)| (-v, m != played));
     let (best, best_score) = scored[0];
     let reply = answer(search, board, me, played);
     MoveAnalysis {
@@ -142,8 +189,11 @@ fn answer(search: &mut Search, board: &Board, me: Player, m: Move) -> Option<Mov
     if moves.is_empty() {
         return None;
     }
+    if let Some(best) = search.tt_best_move(&b, them, DEPTH) {
+        return Some(best);
+    }
     ai::order(&b, them, &mut moves);
-    search.root(&b, them, &moves, DEPTH - 1).map(|(m, _)| m)
+    search.root(&b, them, &moves, DEPTH).map(|(m, _)| m)
 }
 
 /// Classifies a move by win-probability drop (chess-engine style).
@@ -278,5 +328,51 @@ mod tests {
             assert!(m.loss >= 0 && !m.top.is_empty(), "move {i}: {m:?}");
             assert_eq!(m.loss, m.top[0].score - m.score, "move {i}");
         }
+    }
+
+    #[test]
+    fn best_moves_stay_stable_across_turns() {
+        // Playing the engine's best move each turn should not zigzag wildly between odd and even plies.
+        let start = Board::parse(crate::maps::MAPS[0].rows);
+        let mut g = Game::new(start.clone());
+        let mut search = Search::for_analysis();
+        let mut played = Vec::new();
+        for _ in 0..16 {
+            if g.over {
+                break;
+            }
+            let me = g.turn;
+            let mut moves = ai::candidates(&g.board, me);
+            ai::order(&g.board, me, &mut moves);
+            let a = analyse_move(&mut search, &g.board, me, moves[0]);
+            let best = Move { from: a.top[0].from, to: a.top[0].to };
+            played.push(best);
+            g.play(me, best).unwrap();
+        }
+        let analysis = analyse(start, &played);
+        assert_eq!(analysis.moves.len(), played.len());
+        let mut green_scores = Vec::new();
+        for (k, m) in analysis.moves.iter().enumerate() {
+            assert_eq!(m.class, Class::Best, "ply {k} should be Best, got {m:?}");
+            assert_eq!(m.loss, 0);
+            let gs = if k % 2 == 0 { m.score } else { -m.score };
+            if gs.abs() < WIN {
+                green_scores.push(gs);
+            }
+        }
+        let swings: Vec<i32> = green_scores.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+        let mean_swing = swings.iter().map(|&s| s as f64).sum::<f64>() / swings.len().max(1) as f64;
+        assert!(mean_swing < 90.0, "expected stable best-move evals, mean |swing|={mean_swing:.1}, scores={green_scores:?}");
+    }
+
+    #[test]
+    fn combine_handles_forced_outcomes() {
+        assert_eq!(combine(100, -100), 0);
+        assert_eq!(combine(200, 100), 150);
+        // Never average a forced win/loss with a non-forced score; always trust deeper depth.
+        assert_eq!(combine(300, WIN + 500), WIN + 500);
+        assert_eq!(combine(WIN + 500, 300), 300);
+        assert_eq!(combine(-300, -(WIN + 500)), -(WIN + 500));
+        assert_eq!(combine(-(WIN + 500), -300), -300);
     }
 }

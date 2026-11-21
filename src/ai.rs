@@ -40,7 +40,8 @@ const HARD_MAX_DEPTH: u32 = 18;
 const MAX_PLY: usize = 32;
 const TT_BITS: usize = 16;
 const TT_SIZE: usize = 1 << TT_BITS;
-const TT_MASK: usize = TT_SIZE - 1;
+const ANALYSIS_TT_BITS: usize = 19;
+const ANALYSIS_TT_SIZE: usize = 1 << ANALYSIS_TT_BITS;
 
 /// What the computer decides to do on its turn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -632,8 +633,8 @@ fn evaluate(g: &Geom, my: u64, op: u64, mode: EvalMode) -> i32 {
             }
 
             // Side-to-move tempo: ~half an average move's material + Voronoi gain,
-            // accurately valuing initiative and cancelling odd/even horizon zigzag.
-            score += (empty_cnt * 18).min(130);
+            // accurately valuing initiative and keeping qsearch stand-pat calibrated.
+            score += (empty_cnt * 18).min(240);
         }
     }
 
@@ -712,6 +713,9 @@ fn tt_load_score(score: i32, ply: usize) -> i32 {
 pub(crate) struct Search {
     deadline: Option<Instant>,
     mode: EvalMode,
+    /// When true, TT score cutoffs require `entry.depth == depth` so odd/even
+    /// paired-depth searches never mix parities while still reusing `tt_move`.
+    exact_depth: bool,
     nodes: u64,
     aborted: bool,
     tt: Vec<TTEntry>,
@@ -724,10 +728,26 @@ impl Search {
         Self::with_mode(deadline, EvalMode::Full)
     }
 
+    /// Deterministic search for replay analysis: no time limit, exact-depth TT cutoffs,
+    /// and a larger transposition table so paired-depth passes don't thrash.
+    pub(crate) fn for_analysis() -> Search {
+        Search {
+            deadline: None,
+            mode: EvalMode::Full,
+            exact_depth: true,
+            nodes: 0,
+            aborted: false,
+            tt: vec![TTEntry::default(); ANALYSIS_TT_SIZE],
+            killers: [[PackedMove::NONE; 2]; MAX_PLY],
+            history: History::default(),
+        }
+    }
+
     pub(crate) fn with_mode(deadline: Option<Instant>, mode: EvalMode) -> Search {
         Search {
             deadline,
             mode,
+            exact_depth: false,
             nodes: 0,
             aborted: false,
             tt: vec![TTEntry::default(); TT_SIZE],
@@ -755,6 +775,24 @@ impl Search {
             return self.pvs(&g, my, op, p == Player::Green, depth, 1, alpha, beta);
         }
         self.negamax_fallback(board, p, depth, 1, alpha, beta)
+    }
+
+    /// Returns the exact TT best move for `(board, me)` at `depth`, if cached.
+    pub(crate) fn tt_best_move(&self, board: &Board, me: Player, depth: u32) -> Option<Move> {
+        let g = Geom::from_board(board)?;
+        let (my, op) = g.bitboards(board, me);
+        let key = g.hash(my, op, me == Player::Green);
+        let entry = self.tt[(key as usize) & (self.tt.len() - 1)];
+        if entry.flag != FLAG_EXACT || entry.key != key || entry.depth as u32 != depth || entry.best.is_none() {
+            return None;
+        }
+        let (is_jump, from, to) = entry.best.unpack();
+        if is_jump {
+            let m = Move { from, to };
+            board.is_legal(me, m).then_some(m)
+        } else {
+            candidates(board, me).into_iter().find(|&m| m.to == to && !board.is_jump(m))
+        }
     }
 
     fn root_fast(&mut self, g: &Geom, board: &Board, me: Player, moves: &[Move], depth: u32) -> Option<(Move, i32)> {
@@ -880,12 +918,17 @@ impl Search {
 
         let orig_alpha = alpha;
         let key = g.hash(my, op, my_is_green);
-        let tt_idx = (key as usize) & TT_MASK;
+        let tt_idx = (key as usize) & (self.tt.len() - 1);
         let entry = self.tt[tt_idx];
         let mut tt_move = PackedMove::NONE;
         if entry.flag != FLAG_NONE && entry.key == key {
             tt_move = entry.best;
-            if entry.depth as u32 >= depth {
+            let depth_ok = if self.exact_depth {
+                entry.depth as u32 == depth
+            } else {
+                entry.depth as u32 >= depth
+            };
+            if depth_ok {
                 let s = tt_load_score(entry.score, ply);
                 match entry.flag {
                     FLAG_EXACT => return s,

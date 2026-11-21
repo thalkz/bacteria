@@ -1336,7 +1336,6 @@ class ReplayView {
     this.id = id;
     this.ply = 0; // moves played on the board
     this.analysis = null;
-    this.variation = null; // the best line being shown instead of the game
     this.marked = {};
     app.innerHTML = '<div class="loading"><span class="spinner"></span></div>';
     this.onKey = e => this.key(e);
@@ -1433,7 +1432,6 @@ class ReplayView {
           <p class="ply-label muted"></p>
         </div>
         <div class="replay-side">
-          <div class="insight" aria-live="polite"></div>
           <div class="chart"></div>
           <div class="summary"></div>
           <div class="movelist-wrap">
@@ -1453,7 +1451,6 @@ class ReplayView {
       fill: $('.evalbar-fill', root),
       label: $('.evalbar-label', root),
     };
-    this.insightEl = $('.insight', root);
     this.chartEl = $('.chart', root);
     this.summaryEl = $('.summary', root);
     this.listEl = $('.movelist', root);
@@ -1474,13 +1471,11 @@ class ReplayView {
   /* --- navigation --- */
 
   click(e) {
-    const t = e.target.closest('[data-ply],[data-nav],[data-act],[data-find]');
+    const t = e.target.closest('[data-ply],[data-nav],[data-find]');
     if (!t || t.disabled) return;
     if (t.dataset.ply) { this.stop(); this.go(+t.dataset.ply, { animate: +t.dataset.ply === this.ply + 1 }); }
     else if (t.dataset.nav) this.nav(t.dataset.nav);
     else if (t.dataset.find) this.find(...t.dataset.find.split(':'));
-    else if (t.dataset.act === 'best') this.showBest();
-    else if (t.dataset.act === 'back') this.go(this.ply, { animate: false });
   }
 
   nav(a) {
@@ -1526,7 +1521,6 @@ class ReplayView {
     p = Math.max(0, Math.min(this.moves.length, p));
     const b = this.board;
     b.cancel();
-    this.variation = null;
     if (animate && p === this.ply + 1) {
       const m = this.moves[this.ply];
       b.sync(this.positions[this.ply]);
@@ -1556,43 +1550,6 @@ class ReplayView {
         return;
       }
     }
-  }
-
-  /** Plays the best move instead of the one played, then the opponent's best answer. */
-  showBest() {
-    const k = this.ply - 1;
-    const a = this.analysis && this.analysis.moves[k];
-    if (!a) return;
-    this.stop();
-    const { w, h } = this.rec;
-    const by = this.moves[k].by;
-    const best = a.top[0];
-    const b = this.board;
-    const pos = { w, h, cells: this.positions[k].split('') };
-    b.cancel();
-    b.sync(this.positions[k]);
-    const first = applyMove(pos, by, best.from, best.to);
-    const afterFirst = pos.cells.join('');
-    let wait = b.animate(first, by);
-    let reply = null;
-    if (a.best_reply && !first.filled.length) {
-      reply = applyMove(pos, other(by), a.best_reply.from, a.best_reply.to);
-      const end = pos.cells.join('');
-      b.later(() => {
-        b.sync(afterFirst);
-        b.animate(reply, reply.by);
-      }, wait + 700);
-      wait += 700 + 1400;
-      b.later(() => b.sync(end), wait);
-    } else {
-      b.later(() => b.sync(afterFirst), wait);
-    }
-    this.variation = { k, first, reply, before: this.positions[k] };
-    this.paintBoardMarks();
-    this.mark('last', []);
-    this.drawArrows(reply ? [best, { ...reply, reply: true }] : [best]);
-    this.paintEvalBar();
-    this.paintInsight();
   }
 
   mark(cls, cells) {
@@ -1659,7 +1616,6 @@ class ReplayView {
         if (top < box.scrollTop + 30 || top > box.scrollTop + box.clientHeight - 60) box.scrollTop = top - box.clientHeight / 2;
       }
     }
-    this.paintInsight();
     this.paintBoardMarks();
     this.paintCursor();
     setHTML(this.summaryEl, this.summaryHTML());
@@ -1676,14 +1632,7 @@ class ReplayView {
       eb.label.textContent = this.analysisFailed ? '–' : '…';
       return;
     }
-    let gScore;
-    if (this.variation) {
-      const k = this.variation.k;
-      const bs = a.moves[k].top[0].score;
-      gScore = this.moves[k].by === 'green' ? bs : -bs;
-    } else {
-      gScore = this.greenScoreAt(this.ply);
-    }
+    const gScore = this.greenScoreAt(this.ply);
     const win = a.win;
     const wp = this.winProb(gScore);
     const pct = gScore >= win ? 100 : gScore <= -win ? 0 : Math.max(4, Math.min(96, wp * 100));
@@ -1704,7 +1653,7 @@ class ReplayView {
     this.gradeEl = null;
     const k = this.ply - 1;
     const a = this.analysis && this.analysis.moves[k];
-    if (!a || this.variation) return this.drawArrows([]);
+    if (!a) return this.drawArrows([]);
     const g = GRADES[a.class];
     const el = document.createElement('span');
     el.className = `grade-badge q-${a.class}`;
@@ -1743,7 +1692,7 @@ class ReplayView {
       const start = [x1 + ux * size * 0.12, y1 + uy * size * 0.12];
       const pt = ([x, y], w) => `${(x + nx * w).toFixed(1)},${(y + ny * w).toFixed(1)}`;
       const points = [pt(start, shaft), pt(base, shaft), pt(base, head), pt(tip, 0), pt(base, -head), pt(base, -shaft), pt(start, -shaft)];
-      return `<polygon class="arrow${m.reply ? ' reply' : ''}" points="${points.join(' ')}"/>`;
+      return `<polygon class="arrow" points="${points.join(' ')}"/>`;
     }).join('');
   }
 
@@ -1792,150 +1741,6 @@ class ReplayView {
       return `<div class="sum-row"><span class="tag ${c}">${playerName(this.rec, c)}</span><span class="chips">${chips}</span></div>`;
     };
     return row('green') + row('red');
-  }
-
-  /* --- the explanation of a move --- */
-
-  paintInsight() {
-    setHTML(this.insightEl, this.variation ? this.variationHTML() : this.ply ? this.moveHTML(this.ply - 1) : this.startHTML());
-  }
-
-  startHTML() {
-    const a = this.analysis;
-    const depth = a ? a.depth : 6;
-    return `
-      <div class="insight-head"><b>Start</b></div>
-      <p>Green moves first. Step through the game with <kbd>←</kbd> <kbd>→</kbd> or the buttons, or tap a move in the list.</p>
-      <p class="muted">Each move is evaluated ${depth} moves ahead (${depth / 2} each) with a chess-style win score weighing cells, territory, mobility, and safety.</p>
-      <p class="muted">
-        <span class="q q-best">★</span> best, <span class="q q-good">✓</span> good, <span class="q q-inaccuracy">?!</span> inaccuracy,
-        <span class="q q-mistake">?</span> mistake, <span class="q q-blunder">??</span> blunder.</p>
-      ${this.analysisStatus()}`;
-  }
-
-  analysisStatus() {
-    if (this.analysis) return '';
-    if (this.analysisFailed) return '<p class="muted">The analysis isn’t available right now.</p>';
-    return '<p class="analysing"><span class="spinner small"></span>Analysing the game…</p>';
-  }
-
-  /** "copies to d4 and converts 2" */
-  describe(color, board, from, to) {
-    const { w, h } = this.rec;
-    const n = captures(board, color, to).length;
-    const act = isJump(w, from, to) ? `jumps from <b>${sq(from, w, h)}</b> to <b>${sq(to, w, h)}</b>` : `copies to <b>${sq(to, w, h)}</b>`;
-    return `${act} and ${n ? `converts <b>${n}</b>` : 'converts nothing'}`;
-  }
-
-  moveHTML(k) {
-    const { w, h } = this.rec;
-    const m = this.moves[k];
-    const c = m.by;
-    const o = other(c);
-    const before = { w, h, cells: this.positions[k] };
-    const after = { w, h, cells: this.positions[k + 1] };
-    const gap = (m.jump ? 0 : 1) + 2 * m.converted.length;
-    const a = this.analysis && this.analysis.moves[k];
-    const grade = a ? GRADES[a.class] : null;
-
-    let html = `
-      <div class="insight-head">
-        <span class="tag ${c}">${NAME[c]}</span><b>${turnOf(k)} ${moveName(m, w, h)}</b>
-        ${grade ? `<span class="badge q-${a.class}"><b>${grade.glyph}</b>${grade.label}</span>` : ''}
-      </div>
-      <p>${NAME[c]} ${this.describe(c, before, m.from, m.to)}${m.jump ? `, leaving ${sq(m.from, w, h)} empty` : ''}.
-        ${gap ? `${NAME[c]} gains ${gap} on ${NAME[o]}.` : 'The gap between the two doesn’t change.'}</p>`;
-    if (m.filled.length) {
-      html += `<p>${NAME[o]} has no move left, so the last ${plural(m.filled.length, 'empty cell')} go to ${NAME[c]}. Game over.</p>`;
-    }
-    if (!a) return html + this.analysisStatus();
-
-    const best = a.top[0];
-    const reply = a.reply;
-    const replyConv = reply ? captures(after, o, reply.to).length : 0;
-    if (reply) {
-      const hole = m.jump && reply.to === m.from;
-      html += `<p>${NAME[o]}’s best answer: <b>${moveName(reply, w, h)}</b>${replyConv ? `, converting ${replyConv}` : ''}${hole ? ', right into the hole the jump left' : ''}.</p>`;
-    }
-    if (a.class === 'forced') return html + '<p class="verdict">It was the only move.</p>';
-    if (a.class === 'best') return html + `<p class="verdict">Nothing better: ${a.choices > 1 ? `the best of ${a.choices} possible moves` : 'the best move'}.</p>`;
-
-    html += `
-      <p class="verdict"><span class="arrow-key" aria-hidden="true"></span>Better: <button type="button" class="mvlink" data-act="best">${moveName(best, w, h)}</button>, which ${this.describe(c, before, best.from, best.to)}.</p>
-      <table class="compare">
-        <tr><th></th><th>Win score (${NAME[c]}’s view)</th></tr>
-        <tr><td>Played ${moveName(m, w, h)}</td><td>${this.outlook(a.score)}</td></tr>
-        <tr><td>Best ${moveName(best, w, h)}</td><td>${this.outlook(best.score)}</td></tr>
-      </table>
-      ${FLAWS.includes(a.class) ? `<p class="tip">${this.tip(k, a, before, replyConv)}</p>` : ''}
-      <button type="button" class="btn ghost small" data-act="best">Show the best move</button>`;
-    return html;
-  }
-
-  outlook(score) {
-    return `<b>${this.fmtScore(score)}</b>`;
-  }
-
-  /** One lesson that fits what went wrong. */
-  tip(k, a, before, replyConv) {
-    const { w, h } = this.rec;
-    const win = this.analysis.win;
-    const m = this.moves[k];
-    const c = m.by;
-    const o = other(c);
-    const best = a.top[0];
-    const bestJump = isJump(w, best.from, best.to);
-    const bestConv = captures(before, c, best.to).length;
-    let bestReplyConv = 0;
-    if (a.best_reply) {
-      const after = { w, h, cells: before.cells.split('') };
-      applyMove(after, c, best.from, best.to);
-      bestReplyConv = captures(after, o, a.best_reply.to).length;
-    }
-    if (best.score >= win) {
-      return `There was a forced win: after ${moveName(best, w, h)}, ${NAME[o]} soon runs out of moves and every empty cell goes to ${NAME[c]}.`;
-    }
-    if (a.score <= -win) {
-      return `This lets ${NAME[o]} force a win: ${NAME[c]} soon has no move left, and when a player can’t move, every empty cell goes to the other one.`;
-    }
-    if (m.jump && a.reply && a.reply.to === m.from && replyConv >= 2) {
-      return 'Jumping out of a group leaves a hole beside your bacteria. The opponent lands in it and converts them.';
-    }
-    if (m.jump && !bestJump && m.converted.length <= bestConv) {
-      return 'A jump costs a cell and leaves a hole behind. Jump only when it converts more or claims crucial territory.';
-    }
-    if (replyConv >= 3 && bestReplyConv < replyConv) {
-      return 'Before moving, check what the opponent takes back. An empty cell touching several of your bacteria is a target.';
-    }
-    if (bestConv > m.converted.length) return 'Look at every capture first: the best move converted more right away.';
-    if (bestConv < m.converted.length && bestReplyConv < replyConv) {
-      return 'Taking the most right now isn’t always best: the best move converts less but leaves the opponent less to take back.';
-    }
-    if (bestConv === 0 && m.converted.length === 0 && bestJump) {
-      return 'Jumping ahead claims open space and cuts off territory before the opponent can reach it.';
-    }
-    if (bestConv === 0 && m.converted.length === 0) {
-      return 'The better move claims more open space and stronger territory control for the moves ahead.';
-    }
-    return 'The difference shows a few moves later. Tap “Show the best move” to see the line.';
-  }
-
-  variationHTML() {
-    const { w, h } = this.rec;
-    const v = this.variation;
-    const a = this.analysis.moves[v.k];
-    const c = v.first.by;
-    const r = v.reply;
-    return `
-      <div class="insight-head"><span class="badge q-best"><b>★</b>Best line</span><span class="muted">instead of ${turnOf(v.k)} ${moveName(this.moves[v.k], w, h)}</span></div>
-      <p><span class="arrow-key" aria-hidden="true"></span>${NAME[c]} ${this.describe(c, { w, h, cells: v.before }, v.first.from, v.first.to)}.</p>
-      ${r ? `<p><span class="arrow-key reply" aria-hidden="true"></span>${NAME[r.by]}’s best answer, <b>${moveName(r, w, h)}</b>, converts ${r.converted.length ? `<b>${r.converted.length}</b>` : 'nothing'}.</p>` : ''}
-      ${v.first.filled.length ? `<p>${NAME[other(c)]} is stuck: ${NAME[c]} takes every empty cell and wins.</p>` : ''}
-      <p class="muted">Win score for ${NAME[c]}: ${this.outlook(a.top[0].score)} instead of ${this.outlook(a.score)}.</p>
-      <div class="row">
-        <button type="button" class="btn ghost small" data-act="best">Replay</button>
-        <button type="button" class="btn small" data-act="back">Back to the game</button>
-      </div>`;
   }
 
   /* --- advantage chart --- */
